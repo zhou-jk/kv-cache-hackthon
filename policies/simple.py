@@ -83,7 +83,7 @@ class PrefixAwareKVCachePolicy(BaseKVCachePolicy):
     W_FREQ: float = 1.0
     W_RECENCY: float = 0.6
     W_IDBIAS: float = 1.4
-    STATS_GC_MULTIPLIER: int = 8
+    STATS_GC_MULTIPLIER: int = 1000
 
     def init(self) -> None:
         self.cache: Set[int] = set()
