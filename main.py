@@ -62,10 +62,14 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
+    cache_size = 0
     if args.trace:
-        events = load_trace_from_jsonl(args.trace, block_field=args.block_field)
+        cache_size, events = load_trace_from_jsonl(args.trace, block_field=args.block_field)
     else:
         events = build_sample_events()
+    if cache_size != 0:
+        args.cache_size = cache_size
+    print(f"使用的缓存大小: {args.cache_size} blocks")
 
     policy_names = [name.strip() for name in args.policies.split(",") if name.strip()]
     if not policy_names:

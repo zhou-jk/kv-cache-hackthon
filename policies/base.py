@@ -49,7 +49,7 @@ def load_trace_from_jsonl(
     path: Path,
     *,
     block_field: str = "hash_ids",
-) -> List[TraceEvent]:
+) -> Tuple[int, List[TraceEvent]]:
     """同时支持 JSONL 与简单文本格式。
 
     文本格式示例：
@@ -84,8 +84,9 @@ def load_trace_from_jsonl(
 
     # --- 解析自定义文本格式 -------------------------------------------------
     lines = stripped
+    cache_size = 0
     if lines and lines[0].isdigit():
-        # 首行可能是记录数量，直接跳过
+        cache_size = int(lines[0])
         lines = lines[1:]
 
     for line_no, line in enumerate(lines, 1):
@@ -112,7 +113,7 @@ def load_trace_from_jsonl(
         for block_id in prompt_blocks:
             events.append((prompt_blocks, block_id, meta.copy()))
 
-    return events
+    return cache_size, events
 
 
 def run_policy(policy: BaseKVCachePolicy, events: Iterable[TraceEvent]) -> Tuple[int, int]:

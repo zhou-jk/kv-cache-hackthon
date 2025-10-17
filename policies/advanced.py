@@ -6,8 +6,6 @@ from .base import BaseKVCachePolicy, BlockEntry, calc_prefix_score
 
 
 class AdvancedKVCachePolicy(BaseKVCachePolicy):
-    """面向 prefix-heavy trace 的 LFU + 前缀复用策略。"""
-
     name = "advanced"
 
     def __init__(
@@ -32,9 +30,8 @@ class AdvancedKVCachePolicy(BaseKVCachePolicy):
         self,
         block_id: int,
         prompt_blocks: Iterable[int],
-        meta: Dict | None = None,
+        meta: Dict[str, Any] | None = None,
     ) -> bool:
-        del meta
         self.step += 1
         prompt_list = list(prompt_blocks)
         score = calc_prefix_score(block_id, prompt_list)
@@ -73,28 +70,32 @@ class AdvancedKVCachePolicy(BaseKVCachePolicy):
         if idx == 0:
             self._ensure_prompt_prefix(prompt_list)
 
-        self._prefetch(prompt_list, block_id)
+        self._prefetch(prompt_list, block_id, meta)
         return False
 
     # ------------------------------ 内部逻辑 ----------------------------- #
 
-    def _prefetch(self, prompt_list: List[int], block_id: int) -> None:
+    def _prefetch(
+        self,
+        prompt_list: List[int],
+        block_id: int,
+        meta: Dict[str, Any] | None,
+    ) -> None:
         try:
             index = len(prompt_list) - 1 - prompt_list[::-1].index(block_id)
         except ValueError:
             index = len(prompt_list) - 1
 
-        for offset in range(1, self.prefetch_depth + 1):
+        depth = self.prefetch_depth
+        for offset in range(1, depth + 1):
             target_idx = index - offset
             if target_idx < 0:
                 break
             candidate_id = prompt_list[target_idx]
             if candidate_id in self.entries:
                 continue
-
             score = calc_prefix_score(candidate_id, prompt_list)
             freq = self.freq_counter.get(candidate_id, 0)
-
             if len(self.entries) >= self.cache_size:
                 victim = self._select_victim()
                 if victim is None:
@@ -102,7 +103,6 @@ class AdvancedKVCachePolicy(BaseKVCachePolicy):
                 if freq <= victim.freq and score <= victim.prefix_score:
                     continue
                 self.entries.pop(victim.block_id, None)
-
             self.entries[candidate_id] = BlockEntry(
                 block_id=candidate_id,
                 last_access=self.step,
@@ -117,7 +117,7 @@ class AdvancedKVCachePolicy(BaseKVCachePolicy):
                 return idx
         return -1
 
-    def _select_victim(self) -> BlockEntry | None:
+    def _select_victim(self) -> Optional[BlockEntry]:
         candidates = [entry for entry in self.entries.values() if not entry.pinned]
         if not candidates:
             candidates = list(self.entries.values())
@@ -130,13 +130,12 @@ class AdvancedKVCachePolicy(BaseKVCachePolicy):
         for i in range(limit):
             block_id = prompt_list[i]
             freq = self.freq_counter.get(block_id, 0)
+            existing = self.entries.get(block_id)
             score = calc_prefix_score(block_id, prompt_list)
-            entry = self.entries.get(block_id)
-            if entry:
-                entry.pinned = True
-                entry.prefix_score = max(entry.prefix_score, score)
+            if existing:
+                existing.pinned = True
+                existing.prefix_score = max(existing.prefix_score, score)
                 continue
-
             if len(self.entries) >= self.cache_size:
                 victim = self._select_victim()
                 if victim is None:
@@ -144,7 +143,6 @@ class AdvancedKVCachePolicy(BaseKVCachePolicy):
                 if freq <= victim.freq and score <= victim.prefix_score:
                     continue
                 self.entries.pop(victim.block_id, None)
-
             self.entries[block_id] = BlockEntry(
                 block_id=block_id,
                 last_access=self.step,
