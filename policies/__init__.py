@@ -6,6 +6,7 @@ from .base import BaseKVCachePolicy, TraceEvent, compare_policies, load_trace_fr
 from .simple import FIFOKVCachePolicy, LRUKVCachePolicy, PrefixAwareKVCachePolicy
 from .advanced import AdvancedKVCachePolicy
 from .workload import WorkloadAwareKVCachePolicy
+from .zjk import PagedEvictionKVCachePolicy
 
 __all__ = [
     "BaseKVCachePolicy",
@@ -29,6 +30,10 @@ def create_policy(name: str, args) -> BaseKVCachePolicy:
         )
     if key in {"workload"}:
         return WorkloadAwareKVCachePolicy(
+            args.cache_size,
+        )
+    if key in {"zjk"}:
+        return PagedEvictionKVCachePolicy(
             args.cache_size,
         )
     if key in {"advanced", "adv"}:
