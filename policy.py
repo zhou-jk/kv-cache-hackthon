@@ -1,110 +1,218 @@
-"""仅使用 GPU 层的 KV Cache 策略实现。
+"""单节点 GPU KV 缓存策略对比框架。
 
-核心思路：
-1. 以 block 粒度维护缓存，命中时更新最近访问步数、访问频率、前缀得分；
-2. 淘汰时综合考虑“距离上次访问的间隔”“使用频率”“在 prompt 中的位置”“是否需要 pin”四类因素；
-3. 结合题面中的“公共前缀”特性，在每次访问时对当前 block 前面的若干块进行前缀预取；
-4. 支持命令行入口，可读取 .jsonl trace（字段默认为 hash_ids）进行评估。
-
-整个实现只包含单层缓存（模拟 GPU KV cache），方便在没有 CPU 存储层的环境下直接使用。
+提供多种策略实现（FIFO、LRU、前缀感知、增强版）并支持直接对比。
+所有策略遵循相同的 `init` / `access` 接口，便于在相同 trace 上评估命中率。
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 TraceEvent = Tuple[List[int], int, Dict[str, Any] | None]
 
 
 # ---------------------------------------------------------------------------
-# 数据结构与缓存层
+# 公共工具
 # ---------------------------------------------------------------------------
+
+
+def calc_prefix_score(block_id: int, prompt_list: List[int]) -> float:
+    """越靠前的 block 得分越高，用于鼓励保留公共前缀。"""
+
+    length = len(prompt_list)
+    if length == 0:
+        return 0.0
+    try:
+        index = prompt_list.index(block_id)
+    except ValueError:
+        index = length - 1
+    return (length - index) / length
 
 
 @dataclass
 class BlockEntry:
-    """单个 block 的缓存元数据。"""
-
     block_id: int
     last_access: int
     freq: int
     prefix_score: float
     pinned: bool = False
+    hot_score: float = 1.0
+    expires_at: int = 0
+    compressed: bool = False
 
 
-class CacheTier:
-    """单层缓存，负责插入/淘汰/命中判断。"""
+class BaseKVCachePolicy:
+    """策略基类，所有策略需实现 init / access。"""
+
+    name: str = "base"
+
+    def __init__(self, cache_size: int) -> None:
+        self.cache_size = max(cache_size, 1)
+
+    def init(self) -> None:  # pragma: no cover - 子类覆写
+        raise NotImplementedError
+
+    def access(  # pragma: no cover - 子类覆写
+        self,
+        block_id: int,
+        prompt_blocks: Iterable[int],
+        meta: Dict[str, Any] | None = None,
+    ) -> bool:
+        raise NotImplementedError
+
+
+# ---------------------------------------------------------------------------
+# 简单策略：FIFO / LRU / 前缀感知
+# ---------------------------------------------------------------------------
+
+
+class FIFOKVCachePolicy(BaseKVCachePolicy):
+    name = "fifo"
+
+    def init(self) -> None:
+        self.queue: List[int] = []
+        self.cache: set[int] = set()
+
+    def access(
+        self,
+        block_id: int,
+        prompt_blocks: Iterable[int],
+        meta: Dict[str, Any] | None = None,
+    ) -> bool:
+        del prompt_blocks, meta
+        if block_id in self.cache:
+            return True
+        if len(self.cache) >= self.cache_size:
+            victim = self.queue.pop(0)
+            self.cache.remove(victim)
+        self.cache.add(block_id)
+        self.queue.append(block_id)
+        return False
+
+
+class LRUKVCachePolicy(BaseKVCachePolicy):
+    name = "lru"
+
+    def init(self) -> None:
+        self.table: OrderedDict[int, None] = OrderedDict()
+
+    def access(
+        self,
+        block_id: int,
+        prompt_blocks: Iterable[int],
+        meta: Dict[str, Any] | None = None,
+    ) -> bool:
+        del prompt_blocks, meta
+        if block_id in self.table:
+            self.table.move_to_end(block_id)
+            return True
+        if len(self.table) >= self.cache_size:
+            self.table.popitem(last=False)
+        self.table[block_id] = None
+        return False
+
+
+class PrefixAwareKVCachePolicy(BaseKVCachePolicy):
+    """简单的前缀感知策略：结合频次/最近访问/前缀权重。"""
+
+    name = "prefix"
 
     def __init__(
         self,
-        capacity_blocks: int,
+        cache_size: int,
         *,
-        recency_weight: float = 1.2,
-        freq_weight: float = 1.6,
-        prefix_weight: float = 2.8,
-        pin_weight: float = 40.0,
+        prefetch_depth: int = 0,
     ) -> None:
-        self.capacity = max(capacity_blocks, 1)
-        self.recency_weight = recency_weight
-        self.freq_weight = freq_weight
-        self.prefix_weight = prefix_weight
-        self.pin_weight = pin_weight
+        super().__init__(cache_size)
+        self.prefetch_depth = max(prefetch_depth, 0)
+
+    def init(self) -> None:
+        self.step = 0
         self.entries: Dict[int, BlockEntry] = {}
 
-    def __contains__(self, block_id: int) -> bool:
-        return block_id in self.entries
-
-    def get(self, block_id: int) -> Optional[BlockEntry]:
-        return self.entries.get(block_id)
-
-    def add(
+    def access(
         self,
-        entry: BlockEntry,
-        current_step: int,
-    ) -> None:
-        if entry.block_id in self.entries:
-            return
-        self._ensure_capacity(current_step)
-        self.entries[entry.block_id] = entry
+        block_id: int,
+        prompt_blocks: Iterable[int],
+        meta: Dict[str, Any] | None = None,
+    ) -> bool:
+        del meta
+        self.step += 1
+        prompt_list = list(prompt_blocks)
+        score = calc_prefix_score(block_id, prompt_list)
+        entry = self.entries.get(block_id)
+        if entry is not None:
+            entry.last_access = self.step
+            entry.freq += 1
+            entry.prefix_score = max(entry.prefix_score, score)
+            return True
 
-    def _ensure_capacity(self, current_step: int) -> None:
-        while len(self.entries) >= self.capacity:
-            victim = self._select_victim(current_step)
-            if victim is None:
-                break
-            self.entries.pop(victim.block_id, None)
+        if len(self.entries) >= self.cache_size:
+            victim_id = max(
+                self.entries,
+                key=lambda bid: self._eviction_penalty(self.entries[bid]),
+            )
+            self.entries.pop(victim_id, None)
 
-    def _select_victim(self, current_step: int) -> Optional[BlockEntry]:
-        if not self.entries:
-            return None
-        return max(
-            self.entries.values(),
-            key=lambda entry: self._eviction_penalty(entry, current_step),
+        self.entries[block_id] = BlockEntry(
+            block_id=block_id,
+            last_access=self.step,
+            freq=1,
+            prefix_score=score,
         )
 
-    def _eviction_penalty(self, entry: BlockEntry, current_step: int) -> float:
-        recency_cost = self.recency_weight * (current_step - entry.last_access)
-        freq_bonus = self.freq_weight * entry.freq
-        prefix_bonus = self.prefix_weight * entry.prefix_score
-        pin_bonus = self.pin_weight if entry.pinned else 0.0
-        return recency_cost - freq_bonus - prefix_bonus - pin_bonus
+        if self.prefetch_depth > 0:
+            self._prefetch(prompt_list, block_id)
+        return False
 
-    @property
-    def used(self) -> int:
-        return len(self.entries)
+    def _eviction_penalty(self, entry: BlockEntry) -> float:
+        return (
+            (self.step - entry.last_access)
+            - 1.2 * entry.freq
+            - 3.0 * entry.prefix_score
+        )
+
+    def _prefetch(self, prompt_list: List[int], block_id: int) -> None:
+        try:
+            index = len(prompt_list) - 1 - prompt_list[::-1].index(block_id)
+        except ValueError:
+            return
+        for offset in range(1, self.prefetch_depth + 1):
+            target = index - offset
+            if target < 0:
+                break
+            candidate = prompt_list[target]
+            if candidate in self.entries:
+                continue
+            score = calc_prefix_score(candidate, prompt_list)
+            if len(self.entries) >= self.cache_size:
+                victim_id = max(
+                    self.entries,
+                    key=lambda bid: self._eviction_penalty(self.entries[bid]),
+                )
+                if self._eviction_penalty(self.entries[victim_id]) <= 0:
+                    break
+                self.entries.pop(victim_id, None)
+            self.entries[candidate] = BlockEntry(
+                block_id=candidate,
+                last_access=self.step,
+                freq=1,
+                prefix_score=score,
+            )
 
 
 # ---------------------------------------------------------------------------
-# 策略主类
+# 增强策略（带 TTL / 热度 / 前缀索引 / 压缩仓库）
 # ---------------------------------------------------------------------------
 
 
-class SingleTierKVCachePolicy:
-    """使用单层缓存的 KV 策略。"""
+class AdvancedKVCachePolicy(BaseKVCachePolicy):
+    name = "advanced"
 
     def __init__(
         self,
@@ -112,24 +220,17 @@ class SingleTierKVCachePolicy:
         *,
         prefetch_window: int = 32,
         prefetch_depth: int = 3,
+        prefix_keep: int = 64,
     ) -> None:
-        self.cache_size = max(cache_size, 1)
+        super().__init__(cache_size)
         self.prefetch_window = max(prefetch_window, 1)
         self.prefetch_depth = max(prefetch_depth, 0)
-        self.tier = CacheTier(self.cache_size)
-        self.step = 0
-
-    # ------------------------------ 公共接口 ----------------------------- #
+        self.prefix_keep = max(prefix_keep, 0)
 
     def init(self) -> None:
-        self.tier = CacheTier(
-            self.cache_size,
-            recency_weight=self.tier.recency_weight,
-            freq_weight=self.tier.freq_weight,
-            prefix_weight=self.tier.prefix_weight,
-            pin_weight=self.tier.pin_weight,
-        )
         self.step = 0
+        self.entries: Dict[int, BlockEntry] = {}
+        self.freq_counter: Dict[int, int] = {}
 
     def access(
         self,
@@ -139,32 +240,46 @@ class SingleTierKVCachePolicy:
     ) -> bool:
         self.step += 1
         prompt_list = list(prompt_blocks)
-        prefix_score = self._calc_prefix_score(block_id, prompt_list)
+        score = calc_prefix_score(block_id, prompt_list)
+        idx = self._locate_block(block_id, prompt_list)
 
-        entry = self.tier.get(block_id)
+        freq = self.freq_counter.get(block_id, 0) + 1
+        self.freq_counter[block_id] = freq
+
+        entry = self.entries.get(block_id)
         if entry is not None:
-            self._touch(entry, prefix_score)
-            self._prefetch(prompt_list, block_id, meta)
-            self._maybe_pin(entry, meta)
+            entry.last_access = self.step
+            entry.freq = freq
+            entry.prefix_score = max(entry.prefix_score, score)
+            if idx >= 0 and idx < self.prefix_keep:
+                entry.pinned = True
+            if idx == 0:
+                self._ensure_prompt_prefix(prompt_list)
             return True
 
-        entry = BlockEntry(
+        if len(self.entries) >= self.cache_size:
+            victim = self._select_victim()
+            if victim is None:
+                return False
+            if freq <= victim.freq and score <= victim.prefix_score:
+                return False
+            self.entries.pop(victim.block_id, None)
+
+        self.entries[block_id] = BlockEntry(
             block_id=block_id,
             last_access=self.step,
-            freq=1,
-            prefix_score=prefix_score,
+            freq=freq,
+            prefix_score=score,
+            pinned=idx >= 0 and idx < self.prefix_keep,
         )
-        self.tier.add(entry, self.step)
+
+        if idx == 0:
+            self._ensure_prompt_prefix(prompt_list)
+
         self._prefetch(prompt_list, block_id, meta)
-        self._maybe_pin(entry, meta)
         return False
 
-    # ------------------------------ 工具逻辑 ----------------------------- #
-
-    def _touch(self, entry: BlockEntry, prefix_score: float) -> None:
-        entry.last_access = self.step
-        entry.freq += 1
-        entry.prefix_score = max(entry.prefix_score, prefix_score)
+    # ------------------------------ 内部逻辑 ----------------------------- #
 
     def _prefetch(
         self,
@@ -178,55 +293,73 @@ class SingleTierKVCachePolicy:
             index = len(prompt_list) - 1
 
         depth = self.prefetch_depth
-        if meta:
-            inp = meta.get("input_length") or meta.get("prompt_length")
-            if isinstance(inp, int) and inp > self.prefetch_window * 3:
-                depth = min(depth + 1, depth + 2)
-
         for offset in range(1, depth + 1):
             target_idx = index - offset
             if target_idx < 0:
                 break
             candidate_id = prompt_list[target_idx]
-            if candidate_id in self.tier:
+            if candidate_id in self.entries:
                 continue
-            score = self._calc_prefix_score(candidate_id, prompt_list)
-            entry = BlockEntry(
+            score = calc_prefix_score(candidate_id, prompt_list)
+            freq = self.freq_counter.get(candidate_id, 0)
+            if len(self.entries) >= self.cache_size:
+                victim = self._select_victim()
+                if victim is None:
+                    break
+                if freq <= victim.freq and score <= victim.prefix_score:
+                    continue
+                self.entries.pop(victim.block_id, None)
+            self.entries[candidate_id] = BlockEntry(
                 block_id=candidate_id,
                 last_access=self.step,
-                freq=1,
+                freq=freq,
                 prefix_score=score,
+                pinned=target_idx < self.prefix_keep,
             )
-            self.tier.add(entry, self.step)
 
-    def _maybe_pin(self, entry: BlockEntry, meta: Dict[str, Any] | None) -> None:
-        if meta is None:
-            return
-        if meta.get("round", 0) == 0 or meta.get("turn", 0) == 0:
-            entry.pinned = True
-            return
-        session_type = meta.get("session_type") or meta.get("app_type")
-        if session_type in {"system", "instruction", "retrieval"}:
-            entry.pinned = True
-            return
-        input_len = meta.get("input_length") or meta.get("prompt_length")
-        if isinstance(input_len, int) and input_len >= self.prefetch_window * 5:
-            entry.pinned = True
+    def _locate_block(self, block_id: int, prompt_list: List[int]) -> int:
+        for idx in range(len(prompt_list) - 1, -1, -1):
+            if prompt_list[idx] == block_id:
+                return idx
+        return -1
 
-    @staticmethod
-    def _calc_prefix_score(block_id: int, prompt_list: List[int]) -> float:
-        length = len(prompt_list)
-        if length == 0:
-            return 0.0
-        try:
-            index = prompt_list.index(block_id)
-        except ValueError:
-            index = length - 1
-        return (length - index) / length
+    def _select_victim(self) -> Optional[BlockEntry]:
+        candidates = [entry for entry in self.entries.values() if not entry.pinned]
+        if not candidates:
+            candidates = list(self.entries.values())
+            if not candidates:
+                return None
+        return min(candidates, key=lambda e: (e.freq, e.prefix_score, e.last_access))
+
+    def _ensure_prompt_prefix(self, prompt_list: List[int]) -> None:
+        limit = min(len(prompt_list), self.prefetch_window)
+        for i in range(limit):
+            block_id = prompt_list[i]
+            freq = self.freq_counter.get(block_id, 0)
+            existing = self.entries.get(block_id)
+            score = calc_prefix_score(block_id, prompt_list)
+            if existing:
+                existing.pinned = True
+                existing.prefix_score = max(existing.prefix_score, score)
+                continue
+            if len(self.entries) >= self.cache_size:
+                victim = self._select_victim()
+                if victim is None:
+                    break
+                if freq <= victim.freq and score <= victim.prefix_score:
+                    continue
+                self.entries.pop(victim.block_id, None)
+            self.entries[block_id] = BlockEntry(
+                block_id=block_id,
+                last_access=self.step,
+                freq=freq,
+                prefix_score=score,
+                pinned=i < self.prefix_keep,
+            )
 
 
 # ---------------------------------------------------------------------------
-# Trace 装载与评估
+# Trace 读取与评估
 # ---------------------------------------------------------------------------
 
 
@@ -252,10 +385,7 @@ def load_trace_from_jsonl(
     return events
 
 
-def simulate(
-    policy: SingleTierKVCachePolicy,
-    events: Iterable[TraceEvent],
-) -> Tuple[int, int]:
+def run_policy(policy: BaseKVCachePolicy, events: Iterable[TraceEvent]) -> Tuple[int, int]:
     policy.init()
     hits = 0
     total = 0
@@ -266,18 +396,20 @@ def simulate(
     return hits, total
 
 
-def build_sample_trace() -> List[TraceEvent]:
-    prompts = [
-        [1, 2, 3, 4],
-        [1, 2, 3, 4, 5],
-        [1, 2, 6],
-    ]
-    events: List[TraceEvent] = []
-    for prompt in prompts:
-        meta = {"input_length": len(prompt), "round": 0}
-        for block in prompt:
-            events.append((prompt, block, meta))
-    return events
+def compare_policies(policies: Sequence[BaseKVCachePolicy], events: Iterable[TraceEvent]) -> None:
+    print("=== 策略对比 ===")
+    header = "{:<12} {:>12} {:>12} {:>12}".format("Policy", "Total", "Hits", "HitRate")
+    print(header)
+    print("-" * len(header))
+    for policy in policies:
+        hits, total = run_policy(policy, events)
+        hit_rate = hits / total if total else 0.0
+        print(
+            "{:<12} {:>12} {:>12} {:>11.2%}".format(
+                policy.name, total, hits, hit_rate
+            )
+        )
+    print("=" * len(header))
 
 
 # ---------------------------------------------------------------------------
@@ -285,8 +417,29 @@ def build_sample_trace() -> List[TraceEvent]:
 # ---------------------------------------------------------------------------
 
 
+def create_policy(name: str, args: argparse.Namespace) -> BaseKVCachePolicy:
+    key = name.strip().lower()
+    if key in {"fifo"}:
+        return FIFOKVCachePolicy(args.cache_size)
+    if key in {"lru"}:
+        return LRUKVCachePolicy(args.cache_size)
+    if key in {"prefix", "pref"}:
+        return PrefixAwareKVCachePolicy(
+            args.cache_size,
+            prefetch_depth=args.prefetch_depth,
+        )
+    if key in {"advanced", "adv"}:
+        return AdvancedKVCachePolicy(
+            args.cache_size,
+            prefetch_window=args.prefetch_window,
+            prefetch_depth=args.prefetch_depth,
+            prefix_keep=args.prefix_keep,
+        )
+    raise ValueError(f"未知策略名称: {name}")
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="单层 KV Cache 策略评估工具")
+    parser = argparse.ArgumentParser(description="KV Cache 策略评估工具")
     parser.add_argument("--trace", type=Path, help="JSONL trace 文件路径")
     parser.add_argument(
         "--cache-size",
@@ -311,26 +464,50 @@ def main() -> None:
         default="hash_ids",
         help="JSONL 中存放 block 列表的字段名",
     )
+    parser.add_argument(
+        "--prefix-keep",
+        type=int,
+        default=64,
+        help="增强策略：优先保留每个 prompt 的前多少个 block",
+    )
+    parser.add_argument(
+        "--policies",
+        default="advanced",
+        help="要运行的策略列表，逗号分隔（如：fifo,lru,prefix,advanced）",
+    )
     args = parser.parse_args()
 
     if args.trace:
         events = load_trace_from_jsonl(args.trace, block_field=args.block_field)
     else:
-        events = build_sample_trace()
+        sample = [
+            ([1, 2, 3, 4], {"input_length": 4, "round": 0, "type": 1}),
+            ([1, 2, 3, 4, 5], {"input_length": 5, "round": 1, "type": 1}),
+            ([1, 2, 6], {"input_length": 3, "round": 1, "type": 2}),
+        ]
+        events = []
+        for blocks, meta in sample:
+            for block in blocks:
+                events.append((blocks, block, meta))
 
-    policy = SingleTierKVCachePolicy(
-        cache_size=args.cache_size,
-        prefetch_window=args.prefetch_window,
-        prefetch_depth=args.prefetch_depth,
-    )
-    hits, total = simulate(policy, events)
-    hit_rate = hits / total if total else 0.0
+    policy_names = [name.strip() for name in args.policies.split(",") if name.strip()]
+    if not policy_names:
+        raise ValueError("必须至少指定一种策略")
 
-    print("=== KV Cache 策略评估结果 ===")
-    print(f"- 总访问: {total}")
-    print(f"- 命中数: {hits}")
-    print(f"- 命中率: {hit_rate:.2%}")
-    print(f"- GPU 占用: {policy.tier.used}/{policy.cache_size}")
+    policies = [create_policy(name, args) for name in policy_names]
+
+    if len(policies) == 1:
+        policy = policies[0]
+        hits, total = run_policy(policy, events)
+        hit_rate = hits / total if total else 0.0
+
+        print("=== KV Cache 策略评估结果 ===")
+        print(f"策略: {policy.name}")
+        print(f"- 总访问: {total}")
+        print(f"- 命中数: {hits}")
+        print(f"- 命中率: {hit_rate:.2%}")
+    else:
+        compare_policies(policies, events)
 
 
 if __name__ == "__main__":
