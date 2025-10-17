@@ -77,18 +77,7 @@ def main() -> None:
 
     policies = [create_policy(name, args) for name in policy_names]
 
-    if len(policies) == 1:
-        policy = policies[0]
-        hits, total = run_policy(policy, events)
-        hit_rate = hits / total if total else 0.0
-
-        print("=== KV Cache 策略评估结果 ===")
-        print(f"策略: {policy.name}")
-        print(f"- 总访问: {total}")
-        print(f"- 命中数: {hits}")
-        print(f"- 命中率: {hit_rate:.2%}")
-    else:
-        compare_policies(policies, events)
+    compare_policies(policies, events)
 
 
 if __name__ == "__main__":
