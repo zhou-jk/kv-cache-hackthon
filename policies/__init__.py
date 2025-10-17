@@ -4,9 +4,10 @@ from typing import Iterable, Sequence, Tuple
 
 from .base import BaseKVCachePolicy, TraceEvent, compare_policies, load_trace_from_jsonl, run_policy
 from .simple import FIFOKVCachePolicy, LRUKVCachePolicy, PrefixAwareKVCachePolicy
-from .advanced import AdvancedKVCachePolicy
 from .workload import WorkloadAwareKVCachePolicy
 from .zjk import PagedEvictionKVCachePolicy
+from .s3fifo import S3FIFOKVCachePolicy
+from .complex import LRUKKVCachePolicy
 
 __all__ = [
     "BaseKVCachePolicy",
@@ -28,7 +29,7 @@ def create_policy(name: str, args) -> BaseKVCachePolicy:
         return PrefixAwareKVCachePolicy(
             args.cache_size,
         )
-    if key in {"workload"}:
+    if key in {"wa"}:
         return WorkloadAwareKVCachePolicy(
             args.cache_size,
         )
@@ -36,11 +37,12 @@ def create_policy(name: str, args) -> BaseKVCachePolicy:
         return PagedEvictionKVCachePolicy(
             args.cache_size,
         )
-    if key in {"advanced", "adv"}:
-        return AdvancedKVCachePolicy(
+    if key in {"complex"}:
+        return LRUKKVCachePolicy(
             args.cache_size,
-            prefetch_window=args.prefetch_window,
-            prefetch_depth=args.prefetch_depth,
-            prefix_keep=args.prefix_keep,
+        )
+    if key in {"s3"}:
+        return S3FIFOKVCachePolicy(
+            args.cache_size,
         )
     raise ValueError(f"未知策略名称: {name}")

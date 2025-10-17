@@ -64,79 +64,81 @@ class LRUKVCachePolicy(BaseKVCachePolicy):
         return False
 
 import heapq
+import math
 from collections import defaultdict
-from typing import Any, Dict, Iterable, Set
+from typing import Iterable, Dict, Any, Optional, Set, Tuple, List
 
 class PrefixAwareKVCachePolicy(BaseKVCachePolicy):
     """
     PALFU (优化版 with Future-Aware Weights):
-    - 两堆 + 懒失效 的框架保留
-    - 分值策略改为：频率 + 新近度 + 位置（靠前更大） + 本轮未来强保护
-    - 冷启动用 LRU（含未来保护）；支持 meta['type'] 调权
+    - 保留两堆 + 懒失效 + 前缀EMA框架
+      * pin_heap: 维护 r 个“前缀位”的集合（仍用编号近似，以与你现有逻辑兼容）
+      * cand_heap: 非前缀候选的小根堆 (keep_score 越小越先被淘汰)
+      * all_id_minheap: 便于扩张前缀
+    - 新增: 频率 + 新近度 + 位置 的加权 keep_score；若“本轮当前位置之后还会出现”则强保护
+    - 冷启动前 X 次：退化为 LRU（但仍避开“将来要用”的块）
+    - 支持 meta['type'] 影响权重（如 chat/agent 偏位置，search/RAG 偏频率）
     """
     name = "palfu"
 
     # ------------------------ 可调参数 ------------------------
-    PREFIX_RESERVE_RATIO: float = 0.4
-    PREFIX_EMA_ALPHA: float = 0.9
+    PREFIX_RESERVE_RATIO: float = 0.40
+    PREFIX_MAX_LENGTH: int = 512
+    PREFIX_EMA_ALPHA: float = 0.90
 
-    # 加权（默认；可被 type 覆盖）
+    # 加权（可被 type 覆盖）
     W_FREQ: float = 1.0
     W_RECENCY: float = 0.6
     W_POS: float = 1.2
 
-    # 大系数：若本轮之后还会再访问 -> keep_score *= FUTURE_MULT
+    # 若本轮之后还会再出现 -> keep_score *= FUTURE_MULT (强保护)
     FUTURE_MULT: float = 1e6
 
     # 位置“头部”阈值：越靠前越像公共前缀，越该保留
     POS_HEAD_CUTOFF: int = 256
 
-    # 冷启动与低频
+    # 冷启动与低频（前 X 次/单块频次 <= FREQ_COLD 时偏向 LRU）
     WARMUP_GLOBAL: int = 2000
     FREQ_COLD: int = 1
 
-    # 懒失效重算的容差
+    # 懒失效重算容差
     HEAP_EPS: float = 1e-9
 
     # 统计 GC
     STATS_GC_MULTIPLIER: int = 1000
 
+    # ------------------------ 初始化 ------------------------
     def init(self) -> None:
         self.cache: Set[int] = set()
         self.cache_size: int = getattr(self, "cache_size", 0)
         self.step: int = 0
+        self.miss: int = 0
+        self.access_count: int = 0
 
         # 统计
         self.freq: Dict[int, int] = defaultdict(int)
         self.last_access: Dict[int, int] = {}
 
-        # -------- 前缀 EMA / 指纹（保留原有机制） --------
+        # 前缀 EMA / 指纹（与你原逻辑一致）
         self.prefix_len_ema: float = 0.0
-        self._last_prompt_fp: int | None = None
+        self._last_prompt_fp: Optional[int] = None
 
         # ---------- 堆 & 懒失效状态 ----------
-        # 前缀的“r 个最小 id” -> max-heap: (-id, id)
-        self._pin_heap: list[tuple[int, int]] = []
+        self._pin_heap: List[Tuple[int, int]] = []           # (-id, id)
         self._is_pinned: Set[int] = set()
 
-        # 非前缀候选（按 keep_score） -> min-heap: (keep_score, gen, id)
-        self._cand_heap: list[tuple[float, int, int]] = []
-        self._stamp: Dict[int, int] = {}   # id -> 最新代数（用于懒失效）
-
-        # 全部 id 的最小堆（用于扩张前缀时快速拿到最小未 pinned 的 id）
-        self._all_id_minheap: list[int] = []
-
-        # 版本计数器（用于 cand_heap 懒失效）
+        self._cand_heap: List[Tuple[float, int, int]] = []   # (keep_score, gen, id)
+        self._stamp: Dict[int, int] = {}                     # id -> 最新代数
         self._gen: int = 0
 
-        # 当前目标前缀数 r
+        self._all_id_minheap: List[int] = []                 # 所有 id 的 min-heap
         self._r_target: int = 0
 
-        # ---- 位置/未来 —— 你的优化所需 ----
+        # ---- 位置/未来 ----
         self._cur_prompt_key: Optional[int] = None
-        self._pos_map: Dict[int, int] = {}     # 当前 prompt: block_id -> 位置索引（0-based）
-        self._cur_idx: Optional[int] = None    # 当前访问位置索引
-        self._last_meta: Optional[Dict[str, Any]] = None  # 供内部回调时使用
+        self._pos_map: Dict[int, int] = {}     # 当前 prompt: id -> 位置(0-based)
+        self._cur_idx: Optional[int] = None    # 当前访问位置
+        self._last_meta: Optional[Dict[str, Any]] = None
 
     # ------------------------ 后端 add/del ------------------------
     @staticmethod
@@ -162,7 +164,7 @@ class PrefixAwareKVCachePolicy(BaseKVCachePolicy):
                     pass
         self._call_backend("del", block_id)
 
-    # ------------------------ 前缀 EMA（保留） ------------------------
+    # ------------------------ 前缀 EMA（保留原逻辑） ------------------------
     @staticmethod
     def _contiguous_prefix_len(blocks: Iterable[int]) -> int:
         s = set(blocks)
@@ -176,7 +178,7 @@ class PrefixAwareKVCachePolicy(BaseKVCachePolicy):
     def _maybe_update_prefix_ema(self, prompt_blocks: Iterable[int]) -> None:
         if not prompt_blocks:
             return
-        bl = list(prompt_blocks)  # 必须保持有序
+        bl = list(prompt_blocks)  # 需保持顺序
         mn, mx, ln = min(bl), max(bl), len(bl)
         fp = (mx << 21) ^ (mn << 11) ^ ln
         if self._last_prompt_fp == fp:
@@ -190,14 +192,14 @@ class PrefixAwareKVCachePolicy(BaseKVCachePolicy):
         )
         self._rebalance_pinned_if_needed()
 
-    # ------------------------ 你的优化所需：位置/未来 ------------------------
+    # ------------------------ 位置/未来 ------------------------
     def _ensure_pos_map(self, prompt_blocks: Iterable[int]) -> None:
-        seq = list(prompt_blocks)  # 需保持顺序；若上游传 set 会破坏语义
+        seq = list(prompt_blocks)  # 必须有序；若传 set 会破坏位置/未来语义
         key = hash(tuple(seq))
         if key != self._cur_prompt_key:
             self._cur_prompt_key = key
             self._pos_map = {b: i for i, b in enumerate(seq)}
-            self._cur_idx = None  # 新 prompt，从头开始
+            self._cur_idx = None
 
     def _will_appear_later(self, bid: int) -> bool:
         if self._cur_idx is None:
@@ -206,26 +208,26 @@ class PrefixAwareKVCachePolicy(BaseKVCachePolicy):
         return (pos is not None) and (pos > self._cur_idx)
 
     # ------------------------ 权重选择（按 type） ------------------------
-    def _select_weights_by_type(self, meta: Optional[Dict[str, Any]]) -> tuple[float, float, float]:
+    def _select_weights_by_type(self, meta: Optional[Dict[str, Any]]) -> Tuple[float, float, float]:
         t = None
         if meta:
             t = (meta.get("type") or meta.get("app") or meta.get("prompt_type"))
             if isinstance(t, str):
                 t = t.lower().strip()
         if t in {"chat", "agent", "assistant"}:
-            return (1.0, 0.6, 1.8)    # freq, rec, pos
+            return (1.0, 0.6, 1.8)    # 更重位置（前缀）
         if t in {"search", "rag", "docqa", "qa"}:
-            return (1.6, 0.6, 0.9)
+            return (1.6, 0.6, 0.9)    # 更重频率
         return (self.W_FREQ, self.W_RECENCY, self.W_POS)
 
-    # ------------------------ keep_score 计算（越大越该保留） ------------------------
+    # ------------------------ keep_score（越大越应保留） ------------------------
     def _pos_score(self, bid: int) -> float:
         pos = self._pos_map.get(bid)
         if pos is None:
             return 0.0
         if pos <= self.POS_HEAD_CUTOFF:
             return 1.0 / (1.0 + pos)
-        # 超过头部区域：快速衰减，防止远端位置过度加分
+        # 远离头部快速衰减，避免放大尾部位置
         return 1.0 / (1.0 + self.POS_HEAD_CUTOFF + 4.0 * (pos - self.POS_HEAD_CUTOFF))
 
     def _recency_score(self, bid: int) -> float:
@@ -234,27 +236,24 @@ class PrefixAwareKVCachePolicy(BaseKVCachePolicy):
         return 1.0 / (1.0 + max(0, age))
 
     def _freq_score(self, bid: int) -> float:
-        return math.log1p(float(self.freq.get(bid, 0)))
+        return math.log1p(float(self.freq.get(bid, 0)))  # 平滑，避免碾压
 
-    def _score(self, block_id: int, meta: Optional[Dict[str, Any]]) -> float:
-        """
-        keep_score = wf*freq + wr*rec + wp*pos
-        若本轮之后还会再访问 -> keep_score *= FUTURE_MULT
-        （注意：这里不再使用 ID 偏置，以对齐你的加权需求）
-        """
+    def _keep_score(self, bid: int, meta: Optional[Dict[str, Any]]) -> float:
+        # 低频时偏 LRU（但仍受未来保护）
+        if self.freq.get(bid, 0) <= self.FREQ_COLD:
+            s = self._recency_score(bid)
+            if self._will_appear_later(bid):
+                s *= self.FUTURE_MULT
+            return s
         wf, wr, wp = self._select_weights_by_type(meta)
-        s = (
-            wf * self._freq_score(block_id)
-            + wr * self._recency_score(block_id)
-            + wp * self._pos_score(block_id)
-        )
-        if self._will_appear_later(block_id):
+        s = wf * self._freq_score(bid) + wr * self._recency_score(bid) + wp * self._pos_score(bid)
+        if self._will_appear_later(bid):
             s *= self.FUTURE_MULT
         return s
 
     # ------------------------ 堆维护工具 ------------------------
     def _pinned_target_count(self) -> int:
-        hard_cap = int(self.cache_size * self.PREFIX_RESERVE_RATIO)
+        hard_cap = min(int(self.cache_size * self.PREFIX_RESERVE_RATIO), self.PREFIX_MAX_LENGTH)
         ema_cap = int(self.prefix_len_ema + 1e-6)
         return max(0, min(hard_cap, ema_cap))
 
@@ -262,9 +261,7 @@ class PrefixAwareKVCachePolicy(BaseKVCachePolicy):
         new_r = self._pinned_target_count()
         if new_r == self._r_target:
             return
-
         if new_r < self._r_target:
-            # 缩小：弹出若干“编号最大”的前缀转入候选堆
             k = self._r_target - new_r
             for _ in range(k):
                 while self._pin_heap:
@@ -275,7 +272,6 @@ class PrefixAwareKVCachePolicy(BaseKVCachePolicy):
                         break
             self._r_target = new_r
         else:
-            # 扩大：把“最小的未 pinned id”补进前缀
             k = new_r - self._r_target
             for _ in range(k):
                 nid = self._pop_smallest_unpinned_id()
@@ -291,12 +287,11 @@ class PrefixAwareKVCachePolicy(BaseKVCachePolicy):
         heapq.heappush(self._pin_heap, (-bid, bid))
 
     def _push_candidate(self, bid: int, meta: Optional[Dict[str, Any]] = None) -> None:
-        """把非前缀的块压到候选堆（按 keep_score），并递增代数用于懒失效。"""
         if bid in self._is_pinned or bid not in self.cache:
             return
         self._gen += 1
         self._stamp[bid] = self._gen
-        s = self._score(bid, meta)
+        s = self._keep_score(bid, meta)
         heapq.heappush(self._cand_heap, (s, self._gen, bid))
 
     def _pop_smallest_unpinned_id(self) -> Optional[int]:
@@ -310,12 +305,12 @@ class PrefixAwareKVCachePolicy(BaseKVCachePolicy):
         """
         受害者选择：
           - 冷启动：LRU + 未来保护
-          - 正常：cand_heap 懒失效；为空则从 pin_heap 里挑（仍尊重“未来保护”，必要时选最远未来）
+          - 正常：cand_heap 懒失效；若空再从 pin_heap 中选（优先不杀“本轮还会用”的；必要时选“未来距离最远”的）
         """
         if not self.cache:
             raise RuntimeError("cache empty when picking victim")
 
-        # 冷启动：LRU + 未来保护
+        # 冷启动：线性 LRU + 未来保护
         if self.step <= self.WARMUP_GLOBAL:
             oldest_id, oldest_age = None, -1
             furthest_id, furthest_d = None, -1
@@ -331,24 +326,23 @@ class PrefixAwareKVCachePolicy(BaseKVCachePolicy):
                         furthest_d, furthest_id = d, b
             return oldest_id if oldest_id is not None else furthest_id
 
-        # 正常阶段：cand_heap 懒失效 + 现时重算
+        # 正常阶段：候选堆懒失效 + 现时重算
         while self._cand_heap:
             s_old, gen, bid = heapq.heappop(self._cand_heap)
             if (bid not in self.cache) or (bid in self._is_pinned) or (self._stamp.get(bid) != gen):
                 continue
-            s_now = self._score(bid, meta)
+            s_now = self._keep_score(bid, meta)
             if abs(s_now - s_old) > self.HEAP_EPS:
-                # 分数变化：以新分数入堆，继续找
                 self._gen += 1
                 self._stamp[bid] = self._gen
                 heapq.heappush(self._cand_heap, (s_now, self._gen, bid))
                 continue
             return bid
 
-        # 候选堆空：从前缀里选，但仍尊重“未来保护”
-        tmp = []  # 临时存放弹出的 pin
-        best_nonfuture = (None, float("inf"))  # (bid, keep_score) —— 本轮不会再用里选最小 keep_score
-        best_future = (None, -1)               # (bid, d) —— 若都要再用，则选未来距离最远
+        # 候选堆空：从前缀里选 —— 仍遵守“未来保护”
+        tmp: List[Tuple[int, int]] = []
+        best_nonfuture: Tuple[Optional[int], float] = (None, float("inf"))  # (id, keep_score)
+        best_future: Tuple[Optional[int], int] = (None, -1)                # (id, distance)
         while self._pin_heap:
             negid, bid = heapq.heappop(self._pin_heap)
             if bid not in self.cache or bid not in self._is_pinned:
@@ -356,8 +350,9 @@ class PrefixAwareKVCachePolicy(BaseKVCachePolicy):
             tmp.append((negid, bid))
             pos = self._pos_map.get(bid)
             if (self._cur_idx is None) or (pos is None) or (pos <= self._cur_idx):
-                # 本轮不会再访问：按 keep_score 选择最小者
-                ks = self._score(bid, meta) / (self.FUTURE_MULT if self._will_appear_later(bid) else 1.0)
+                # 本轮不会再访问：选 keep_score 最小的
+                ks = self._keep_score(bid, meta)
+                # 这里 _keep_score 已考虑 FUTURE_MULT；但对“不会再访问”的项，等价于原值
                 if ks < best_nonfuture[1]:
                     best_nonfuture = (bid, ks)
             else:
@@ -365,19 +360,16 @@ class PrefixAwareKVCachePolicy(BaseKVCachePolicy):
                 if d > best_future[1]:
                     best_future = (bid, d)
 
-        # 把没选到的 pin 重新放回
-        selected = best_nonfuture[0] if best_nonfuture[0] is not None else best_future[0]
+        chosen = best_nonfuture[0] if best_nonfuture[0] is not None else best_future[0]
+        # 把其余 pin 放回
         for negid, bid in tmp:
-            if bid != selected:
+            if bid != chosen:
                 heapq.heappush(self._pin_heap, (negid, bid))
-
-        # 取消选中者的 pinned 状态
-        if selected is not None and selected in self._is_pinned:
-            self._is_pinned.remove(selected)
-        return selected if selected is not None else (max(self.cache))  # 极端兜底
+        if chosen is not None and chosen in self._is_pinned:
+            self._is_pinned.remove(chosen)
+        return chosen if chosen is not None else max(self.cache)
 
     def _admit_new_block(self, bid: int, meta: Optional[Dict[str, Any]]) -> None:
-        """新块加入：依据 r 与前缀最大编号，决定是否进前缀；否则进候选堆。"""
         heapq.heappush(self._all_id_minheap, bid)
         self._rebalance_pinned_if_needed()
 
@@ -386,8 +378,7 @@ class PrefixAwareKVCachePolicy(BaseKVCachePolicy):
             return
 
         if self._pin_heap:
-            # 若新块编号比当前前缀中的“最大编号”还小，则交换（保留你原有逻辑）
-            _, cur_max = self._pin_heap[0]
+            _, cur_max = self._pin_heap[0]  # 编号最大的前缀
             if bid < cur_max:
                 heapq.heappop(self._pin_heap)
                 if cur_max in self._is_pinned:
@@ -396,7 +387,6 @@ class PrefixAwareKVCachePolicy(BaseKVCachePolicy):
                 self._pin(bid)
                 return
 
-        # 否则作为候选
         self._push_candidate(bid, meta)
 
     # ------------------------ 统计 GC ------------------------
@@ -426,23 +416,22 @@ class PrefixAwareKVCachePolicy(BaseKVCachePolicy):
         self.access_count += 1
         self._last_meta = meta
 
-        # 你的优化：每次都建立/更新本轮的位置信息 & 当前下标
+        # 建立/更新本轮的位置信息 & 当前索引
         self._ensure_pos_map(prompt_blocks)
         self._cur_idx = self._pos_map.get(block_id, self._cur_idx)
 
-        # （保留）前缀 EMA，独立于评分逻辑
+        # 更新前缀 EMA（与你原逻辑一致）
         try:
             self._maybe_update_prefix_ema(prompt_blocks)
         except Exception:
             pass
 
+        # 命中
         if block_id in self.cache:
-            # 命中：更新统计；若非前缀，刷新候选分数（懒失效）
             self.freq[block_id] += 1
             self.last_access[block_id] = self.step
             if block_id not in self._is_pinned:
                 self._push_candidate(block_id, meta)
-            # 统计 GC
             if len(self.freq) > self.STATS_GC_MULTIPLIER * max(1, self.cache_size) or \
                len(self.last_access) > self.STATS_GC_MULTIPLIER * max(1, self.cache_size):
                 self._maybe_gc_stats()
@@ -455,7 +444,7 @@ class PrefixAwareKVCachePolicy(BaseKVCachePolicy):
                 self.cache.remove(victim)
                 self._backend_del(victim)
 
-        # 插入新块（评测要求：所有 miss 都必须 add）
+        # 插入新块（评测：miss 必须 add 并计一次 miss）
         self.cache.add(block_id)
         self.miss += 1
         self._backend_add(block_id)
@@ -464,7 +453,6 @@ class PrefixAwareKVCachePolicy(BaseKVCachePolicy):
 
         self._admit_new_block(block_id, meta)
 
-        # 统计 GC
         if len(self.freq) > self.STATS_GC_MULTIPLIER * max(1, self.cache_size) or \
            len(self.last_access) > self.STATS_GC_MULTIPLIER * max(1, self.cache_size):
             self._maybe_gc_stats()
