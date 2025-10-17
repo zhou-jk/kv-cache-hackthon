@@ -9,6 +9,8 @@ from heapdict import heapdict
 
 class FIFOKVCachePolicy(BaseKVCachePolicy):
     name = "fifo"
+    miss: int = 0
+    access_count: int = 0
 
     def init(self) -> None:
         self.queue: List[int] = []
@@ -21,6 +23,7 @@ class FIFOKVCachePolicy(BaseKVCachePolicy):
         meta: Dict | None = None,
     ) -> bool:
         del prompt_blocks, meta
+        self.access_count += 1
         if block_id in self.cache:
             return True
         if len(self.cache) >= self.cache_size:
@@ -28,11 +31,14 @@ class FIFOKVCachePolicy(BaseKVCachePolicy):
             self.cache.remove(victim)
         self.cache.add(block_id)
         self.queue.append(block_id)
+        self.miss += 1
         return False
 
 
 class LRUKVCachePolicy(BaseKVCachePolicy):
     name = "lru"
+    miss: int = 0
+    access_count: int = 0
 
     def init(self) -> None:
         from collections import OrderedDict
@@ -45,6 +51,7 @@ class LRUKVCachePolicy(BaseKVCachePolicy):
         prompt_blocks: Iterable[int],
         meta: Dict | None = None,
     ) -> bool:
+        self.access_count += 1
         del prompt_blocks, meta
         if block_id in self.table:
             self.table.move_to_end(block_id)
@@ -52,6 +59,7 @@ class LRUKVCachePolicy(BaseKVCachePolicy):
         if len(self.table) >= self.cache_size:
             self.table.popitem(last=False)
         self.table[block_id] = None
+        self.miss += 1
         return False
 
 import heapq
@@ -310,6 +318,7 @@ class PrefixAwareKVCachePolicy(BaseKVCachePolicy):
     # ------------------------ 主流程 ------------------------
     def access(self, block_id: int, prompt_blocks: Iterable[int], meta: Dict[str, Any] | None = None) -> bool:
         self.step += 1
+        self.access_count += 1
         try:
             self._maybe_update_prefix_ema(prompt_blocks)
         except Exception:
@@ -337,6 +346,7 @@ class PrefixAwareKVCachePolicy(BaseKVCachePolicy):
 
         # 插入新块
         self.cache.add(block_id)
+        self.miss += 1
         self._backend_add(block_id)
         self.freq[block_id] += 1
         self.last_access[block_id] = self.step

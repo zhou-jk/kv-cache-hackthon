@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from typing import Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Optional
 
 from .base import BaseKVCachePolicy, BlockEntry, calc_prefix_score
 
 
 class AdvancedKVCachePolicy(BaseKVCachePolicy):
     name = "advanced"
+    access_count: int = 0
+    miss: int = 0
 
     def __init__(
         self,
@@ -20,6 +22,8 @@ class AdvancedKVCachePolicy(BaseKVCachePolicy):
         self.prefetch_window = max(prefetch_window, 1)
         self.prefetch_depth = max(prefetch_depth, 0)
         self.prefix_keep = max(prefix_keep, 0)
+        self.access_count = 0
+        self.miss = 0
 
     def init(self) -> None:
         self.step = 0
@@ -30,9 +34,11 @@ class AdvancedKVCachePolicy(BaseKVCachePolicy):
         self,
         block_id: int,
         prompt_blocks: Iterable[int],
-        meta: Dict[str, Any] | None = None,
-    ) -> bool:
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> tuple[bool, int]:
+        self.access_count += 1
         self.step += 1
+        added = 0
         prompt_list = list(prompt_blocks)
         score = calc_prefix_score(block_id, prompt_list)
         idx = self._locate_block(block_id, prompt_list)
@@ -48,15 +54,16 @@ class AdvancedKVCachePolicy(BaseKVCachePolicy):
             if idx >= 0 and idx < self.prefix_keep:
                 entry.pinned = True
             if idx == 0:
-                self._ensure_prompt_prefix(prompt_list)
-            return True
+                added += self._ensure_prompt_prefix(prompt_list)
+            added += self._prefetch(prompt_list, block_id, meta)
+            return True, added
 
         if len(self.entries) >= self.cache_size:
             victim = self._select_victim()
             if victim is None:
-                return False
+                return False, 0
             if freq <= victim.freq and score <= victim.prefix_score:
-                return False
+                return False, 0
             self.entries.pop(victim.block_id, None)
 
         self.entries[block_id] = BlockEntry(
@@ -66,12 +73,14 @@ class AdvancedKVCachePolicy(BaseKVCachePolicy):
             prefix_score=score,
             pinned=idx >= 0 and idx < self.prefix_keep,
         )
+        added += 1
 
         if idx == 0:
-            self._ensure_prompt_prefix(prompt_list)
+            added += self._ensure_prompt_prefix(prompt_list)
 
-        self._prefetch(prompt_list, block_id, meta)
-        return False
+        added += self._prefetch(prompt_list, block_id, meta)
+        self.miss += added
+        return False, added
 
     # ------------------------------ 内部逻辑 ----------------------------- #
 
@@ -79,8 +88,9 @@ class AdvancedKVCachePolicy(BaseKVCachePolicy):
         self,
         prompt_list: List[int],
         block_id: int,
-        meta: Dict[str, Any] | None,
-    ) -> None:
+        meta: Optional[Dict[str, Any]],
+    ) -> int:
+        added = 0
         try:
             index = len(prompt_list) - 1 - prompt_list[::-1].index(block_id)
         except ValueError:
@@ -110,6 +120,8 @@ class AdvancedKVCachePolicy(BaseKVCachePolicy):
                 prefix_score=score,
                 pinned=target_idx < self.prefix_keep,
             )
+            added += 1
+        return added
 
     def _locate_block(self, block_id: int, prompt_list: List[int]) -> int:
         for idx in range(len(prompt_list) - 1, -1, -1):
@@ -125,7 +137,8 @@ class AdvancedKVCachePolicy(BaseKVCachePolicy):
                 return None
         return min(candidates, key=lambda e: (e.freq, e.prefix_score, e.last_access))
 
-    def _ensure_prompt_prefix(self, prompt_list: List[int]) -> None:
+    def _ensure_prompt_prefix(self, prompt_list: List[int]) -> int:
+        added = 0
         limit = min(len(prompt_list), self.prefetch_window)
         for i in range(limit):
             block_id = prompt_list[i]
@@ -150,3 +163,5 @@ class AdvancedKVCachePolicy(BaseKVCachePolicy):
                 prefix_score=score,
                 pinned=i < self.prefix_keep,
             )
+            added += 1
+        return added

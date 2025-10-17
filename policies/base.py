@@ -18,6 +18,8 @@ class BlockEntry:
 
 class BaseKVCachePolicy:
     name: str = "base"
+    miss: int = 0
+    access_count: int = 0
 
     def __init__(self, cache_size: int) -> None:
         self.cache_size = max(cache_size, 1)
@@ -124,7 +126,7 @@ def run_policy(policy: BaseKVCachePolicy, events: Iterable[TraceEvent]) -> Tuple
         total += 1
         if policy.access(block_id, prompt_blocks, meta):
             hits += 1
-    return hits, total
+    return policy.miss, total
 
 
 def compare_policies(policies: Sequence[BaseKVCachePolicy], events: Iterable[TraceEvent]) -> None:
@@ -133,11 +135,12 @@ def compare_policies(policies: Sequence[BaseKVCachePolicy], events: Iterable[Tra
     print(header)
     print("-" * len(header))
     for policy in policies:
-        hits, total = run_policy(policy, events)
-        hit_rate = hits / total if total else 0.0
+        miss, total = run_policy(policy, events)
+        hit = total - miss
+        hit_rate = hit / total if total else 0.0
         print(
             "{:<12} {:>12} {:>12} {:>11.2%}".format(
-                policy.name, total, hits, hit_rate
+                policy.name, total, hit, hit_rate
             )
         )
     print("=" * len(header))
