@@ -2,47 +2,43 @@ from __future__ import annotations
 
 from typing import Iterable, Sequence, Tuple
 
-from .base import BaseKVCachePolicy, TraceEvent, compare_policies, load_trace_from_jsonl, run_policy
-from .simple import FIFOKVCachePolicy, LRUKVCachePolicy, PrefixAwareKVCachePolicy
-from .workload import WorkloadAwareKVCachePolicy
-from .zjk import PagedEvictionKVCachePolicy
-from .s3fifo import S3FIFOKVCachePolicy
-from .complex import LRUKKVCachePolicy
+from .base import BaseKVCachePolicy, TraceEvent, compare_policies, load_trace_from_text, run_policy
+from .simple import FIFOKVCachePolicy, LRUKVCachePolicy
+from .palfu import PrefixAwareKVCachePolicy
+from .kvstore import KVCacheStore
+from .wa import WorkloadAwareKVCachePolicy
+from .weight import WeightedEvictionPolicy
+from .kv import KVCachePolicy
 
 __all__ = [
     "BaseKVCachePolicy",
     "TraceEvent",
     "compare_policies",
-    "load_trace_from_jsonl",
+    "load_trace_from_text",
     "run_policy",
     "create_policy",
 ]
 
 
 def create_policy(name: str, args) -> BaseKVCachePolicy:
+    kvstore = KVCacheStore(capacity=args.cache_size)
     key = name.strip().lower()
     if key == "fifo":
-        return FIFOKVCachePolicy(args.cache_size)
+        return FIFOKVCachePolicy(kvstore)
     if key == "lru":
-        return LRUKVCachePolicy(args.cache_size)
-    if key in {"prefix", "pref"}:
+        return LRUKVCachePolicy(kvstore)
+    if key == "kv":
+        return KVCachePolicy(kvstore)
+    if key in {"pref"}:
         return PrefixAwareKVCachePolicy(
-            args.cache_size,
+            kvstore,
         )
     if key in {"wa"}:
         return WorkloadAwareKVCachePolicy(
-            args.cache_size,
+            kvstore,
         )
-    if key in {"zjk"}:
-        return PagedEvictionKVCachePolicy(
-            args.cache_size,
-        )
-    if key in {"complex"}:
-        return LRUKKVCachePolicy(
-            args.cache_size,
-        )
-    if key in {"s3"}:
-        return S3FIFOKVCachePolicy(
-            args.cache_size,
+    if key in {"weight"}:
+        return WeightedEvictionPolicy(
+            kvstore,
         )
     raise ValueError(f"未知策略名称: {name}")

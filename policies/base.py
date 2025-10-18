@@ -4,6 +4,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Set
+from .kvstore import KVCacheStore
 
 TraceEvent = Tuple[List[int], int, Dict[str, Any] | None]
 
@@ -21,17 +22,15 @@ class BaseKVCachePolicy:
     miss: int = 0
     access_count: int = 0
 
-    def __init__(self, cache_size: int) -> None:
-        self.cache_size = max(cache_size, 1)
-
-    def init(self) -> None:  # pragma: no cover
-        raise NotImplementedError
+    def __init__(self, store: KVCacheStore) -> None:
+        self.store = store
+        self.cache_size = max(store.capacity, 1)
 
     def access(  # pragma: no cover
         self,
         block_id: int,
         prompt_blocks: Iterable[int],
-        meta: Dict[str, Any] | None = None,
+        type: int,
     ) -> bool:
         raise NotImplementedError
 
@@ -47,10 +46,8 @@ def calc_prefix_score(block_id: int, prompt_list: List[int]) -> float:
     return (length - index) / length
 
 
-def load_trace_from_jsonl(
+def load_trace_from_text(
     path: Path,
-    *,
-    block_field: str = "hash_ids",
 ) -> Tuple[int, List[TraceEvent]]:
     """同时支持 JSONL 与简单文本格式。
 
@@ -66,30 +63,12 @@ def load_trace_from_jsonl(
     if not stripped:
         return []
 
-    events: List[TraceEvent] = []
-
-    # 尝试解析为 JSONL，如果失败则回退到纯文本解析
-    json_mode = path.name.endswith(".jsonl") or path.name.endswith(".json")
-    if json_mode:
-        for line_no, line in enumerate(stripped, 1):
-            record = json.loads(line)
-            blocks = record.get(block_field)
-            if not isinstance(blocks, list):
-                raise ValueError
-            prompt_blocks = [int(b) for b in blocks]
-            meta = {k: v for k, v in record.items() if k != block_field} or None
-            for block_id in prompt_blocks:
-                events.append((prompt_blocks, block_id, meta))
-
-    if json_mode:
-        return events
-
-    # --- 解析自定义文本格式 -------------------------------------------------
     lines = stripped
     cache_size = 0
     if lines and lines[0].isdigit():
         cache_size = int(lines[0])
         lines = lines[1:]
+    events: List[TraceEvent] = []
 
     for line_no, line in enumerate(lines, 1):
         if "{" not in line or "}" not in line:
@@ -103,30 +82,28 @@ def load_trace_from_jsonl(
         except ValueError as exc:  # pragma: no cover
             raise ValueError(f"第 {line_no} 行无法解析 block 列表：{line}") from exc
 
-        meta: Dict[str, Any] = {"input_length": len(prompt_blocks)}
         tail = line[rbr + 1 :].strip()
+        type = 0
         if tail:
             token = tail.split()[0]
-            try:
-                meta["type"] = int(token)
-            except ValueError:
-                meta["type"] = token
+            type = int(token)
 
         for block_id in prompt_blocks:
-            events.append((prompt_blocks, block_id, meta.copy()))
+            events.append((prompt_blocks, block_id, type))
 
     return cache_size, events
 
 
 def run_policy(policy: BaseKVCachePolicy, events: Iterable[TraceEvent]) -> Tuple[int, int]:
-    policy.init()
     hits = 0
     total = 0
     for prompt_blocks, block_id, meta in events:
         total += 1
         if policy.access(block_id, prompt_blocks, meta):
             hits += 1
-    return policy.miss, total
+        if not policy.store.contains(block_id):
+            raise RuntimeError(f"策略 {policy.name} 未能正确缓存 block {block_id}")
+    return policy.store.miss, total
 
 
 def compare_policies(policies: Sequence[BaseKVCachePolicy], events: Iterable[TraceEvent]) -> None:

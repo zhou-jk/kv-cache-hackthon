@@ -12,7 +12,7 @@ from typing import Iterable, List, Sequence
 
 import matplotlib.pyplot as plt
 
-from policies import compare_policies, create_policy, load_trace_from_jsonl, run_policy
+from policies import compare_policies, create_policy, load_trace_from_text, run_policy
 
 
 @dataclass
@@ -23,7 +23,7 @@ class PolicyArgs:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="批量多线程 KV Cache 策略测试脚本")
     parser.add_argument(
-        "--traces",
+        "--trace",
         nargs="+",
         required=True,
         help="要测试的 trace 文件路径（支持通配符）",
@@ -53,7 +53,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-workers",
         type=int,
-        default=4,
+        default=20,
         help="并行线程数",
     )
     parser.add_argument(
@@ -83,7 +83,7 @@ def run_single_case(
     policy_name: str,
     base_args: argparse.Namespace,
 ) -> dict:
-    cache_size, events = load_trace_from_jsonl(trace_path, block_field=base_args.block_field)
+    cache_size, events = load_trace_from_text(trace_path)
     policy_args = PolicyArgs(
         cache_size=cache_size,
     )
@@ -171,7 +171,7 @@ def set_cpu_affinity(affinity: str | None) -> None:
 def main() -> None:
     args = parse_args()
     set_cpu_affinity(args.cpu_affinity)
-    traces = expand_trace_paths(args.traces)
+    trace = expand_trace_paths(args.trace)
     policy_names = [name.strip() for name in args.policies.split(",") if name.strip()]
     base_args = argparse.Namespace(
         block_field="hash_ids",
@@ -180,7 +180,7 @@ def main() -> None:
     tasks = []
     with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
         future_to_case = {}
-        for trace_path in traces:
+        for trace_path in trace:
             for policy_name in policy_names:
                 future = executor.submit(
                     run_single_case,

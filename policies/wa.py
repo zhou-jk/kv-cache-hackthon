@@ -3,6 +3,7 @@ import math
 from collections import defaultdict
 from typing import Iterable, Dict, Any, Optional, Set, Tuple, List
 from .base import BaseKVCachePolicy
+from .kvstore import KVCacheStore
 
 import math
 import heapq
@@ -20,8 +21,8 @@ class _BlockEntry:
 @dataclass
 class _WorkloadStats:
     # 以指数分布拟合复用时间，lam=1/mean_reuse
-    mu: float = 60.0          # 复用间隔均值（EWMA，单位：tick）
-    lam: float = 1.0 / 60.0   # 指数分布参数
+    mu: float = 100.0          # 复用间隔均值（EWMA，单位：tick）
+    lam: float = 1.0 / 100.0   # 指数分布参数
     n_samples: int = 0
     pq: List[Tuple[int, int]] = field(default_factory=list)  # (last_tick, block_id)，最旧在堆顶
     blocks: set = field(default_factory=set)                 # 该类下的 block 集合
@@ -53,21 +54,18 @@ class WorkloadAwareKVCachePolicy(BaseKVCachePolicy):
 
     def __init__(
         self,
-        cache_size: int,
-        *,
+        store: KVCacheStore,
         fast: bool = True,     # False=全局精确；True=论文优化 O(W)
         alpha: float = 0.1,     # EWMA 更新速度（拟合指数分布的均值）
         life_cap: int = 512,    # 限制 life 的时间窗（tick）
         life_mult: float = 1.0  # life = min(E[T]*life_mult, life_cap)
     ):
-        super().__init__(cache_size)
+        self.store = store
+        self.cache_size = max(store.capacity, 1)
         self.fast = fast
         self.alpha = alpha
         self.life_cap = life_cap
         self.life_mult = life_mult
-
-    # ---------------- Framework Hooks ----------------
-    def init(self) -> None:
         self.ticks: int = 0
         self.access_count: int = 0
         self.miss: int = 0
@@ -75,15 +73,11 @@ class WorkloadAwareKVCachePolicy(BaseKVCachePolicy):
         self.cache: Dict[int, _BlockEntry] = {}
         self.workloads: Dict[Tuple[str, int], _WorkloadStats] = {}
 
-        # 评测环境通常提供 add()/del()；若无则退化为空操作
-        self._add_hook = getattr(self, "add", lambda _id: None)
-        self._del_hook = getattr(self, "del_", getattr(self, "delete", lambda _id: None))
-
     def access(
         self,
         block_id: int,
         prompt_blocks: Iterable[int],
-        meta: Optional[Dict[str, Any]] = None,
+        type: int,
     ) -> bool:
         """
         返回 True=hit, False=miss（每次 add 记一次 miss）。调用结束后，block 一定在 cache 中。
@@ -91,7 +85,7 @@ class WorkloadAwareKVCachePolicy(BaseKVCachePolicy):
         self.access_count += 1
         self.ticks += 1
 
-        cat = self._category_from_meta(meta)
+        cat = self._category_from_type(type)
         stats = self._get_or_create_stats(cat)
         offset = self._position_offset(block_id, prompt_blocks)
 
@@ -116,34 +110,26 @@ class WorkloadAwareKVCachePolicy(BaseKVCachePolicy):
             if v_ent is not None:
                 v_stats = self.workloads[v_ent.cat]
                 v_stats.blocks.discard(victim)
-            self._del_hook(victim)
+            self.store.delete(victim)
 
         # 插入并记 miss
         ent = _BlockEntry(block_id=block_id, cat=cat, last_tick=self.ticks, offset=offset)
         self.cache[block_id] = ent
         stats.blocks.add(block_id)
         heapq.heappush(stats.pq, (ent.last_tick, block_id))
-        self._add_hook(block_id)
+        self.store.add(block_id)
         self.miss += 1
         return False
 
     # ---------------- Internals ----------------
-    def _category_from_meta(self, meta: Optional[Dict[str, Any]]) -> Tuple[str, int]:
+    def _category_from_type(self, type: int) -> Tuple[str, int]:
         """
         工作负载类别： (req_type, turn)
         - req_type 优先从 meta['type'/'req_type'/'app_type'] 取；默认 'unknown'
         - turn 优先从 meta['turn'/'turn_id'/'round'/'session_turn'] 取；默认 1
         论文指出“按类别（type×turn）概率分布可预测且稳定”（图 11、15，页 6–7）。:contentReference[oaicite:1]{index=1}
         """
-        if meta is None:
-            return ("unknown", 1)
-        t = meta.get("type") or meta.get("req_type") or meta.get("app_type") or "unknown"
-        turn = meta.get("turn") or meta.get("turn_id") or meta.get("round") or meta.get("session_turn") or 1
-        try:
-            turn = int(turn)
-        except Exception:
-            turn = 1
-        return (str(t), turn)
+        return ("unknown", type)
 
     def _get_or_create_stats(self, cat: Tuple[str, int]) -> _WorkloadStats:
         s = self.workloads.get(cat)

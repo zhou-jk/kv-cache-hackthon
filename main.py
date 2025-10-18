@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from policies import compare_policies, create_policy, load_trace_from_jsonl, run_policy
+from policies import compare_policies, create_policy, load_trace_from_text, run_policy
 
 
 def build_sample_events():
@@ -29,29 +29,6 @@ def parse_args() -> argparse.Namespace:
         help="GPU 层可存储的 block 数",
     )
     parser.add_argument(
-        "--prefetch-window",
-        type=int,
-        default=32,
-        help="用于调节预取/固定阈值的窗口大小",
-    )
-    parser.add_argument(
-        "--prefetch-depth",
-        type=int,
-        default=3,
-        help="向前预取的最大层数",
-    )
-    parser.add_argument(
-        "--prefix-keep",
-        type=int,
-        default=64,
-        help="增强策略：优先保留 prompt 前若干 block",
-    )
-    parser.add_argument(
-        "--block-field",
-        default="hash_ids",
-        help="JSONL 中存放 block 列表的字段名",
-    )
-    parser.add_argument(
         "--policies",
         default="advanced",
         help="要运行的策略列表，逗号分隔（如：fifo,lru,prefix,advanced）",
@@ -64,7 +41,7 @@ def main() -> None:
 
     cache_size = 0
     if args.trace:
-        cache_size, events = load_trace_from_jsonl(args.trace, block_field=args.block_field)
+        cache_size, events = load_trace_from_text(args.trace)
     else:
         events = build_sample_events()
     if cache_size != 0:
